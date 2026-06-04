@@ -1,3 +1,4 @@
-//! Static host error subcode mappings used by the decode engine.
+//! Category-specific decode mappings.
 
-pub mod context;
+pub mod auth;
+pub mod storage;

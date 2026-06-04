@@ -278,8 +278,7 @@ impl SorobanRpcClient {
 
                     if !status.is_success() {
                         return Err(PrismError::RpcError(format!(
-                            "RPC request failed with HTTP {}: {}",
-                            status, body
+                            "RPC request failed with HTTP {status}: {body}"
                         )));
                     }
                     let rpc_response: JsonRpcResponse<T> = serde_json::from_str(&body)
@@ -591,5 +590,43 @@ mod tests {
             err_msg.to_lowercase().contains("timeout") || err_msg.to_lowercase().contains("error sending request"),
             "Actual error: {}", err_msg
         );
+    }
+
+    #[tokio::test]
+    async fn test_simulate_transaction_returns_rpc_error_on_failure() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let rpc_url = format!("http://{}", addr);
+
+        let config = NetworkConfig {
+            network: crate::network::Network::Testnet,
+            rpc_url,
+            network_passphrase: "test".to_string(),
+            archive_urls: vec![],
+            api_key: None,
+            request_timeout_secs: 30,
+        };
+        let client = SorobanRpcClient::new(&config);
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let body = r#"{"jsonrpc":"2.0","id":1,"result":{"latestLedger":100,"error":"contract trap"}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let result = client.simulate_transaction("AAAA").await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PrismError::RpcError(msg) => assert!(msg.contains("contract trap")),
+            _ => panic!("Expected PrismError::RpcError"),
+        }
     }
 }
