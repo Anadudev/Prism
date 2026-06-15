@@ -101,9 +101,20 @@ pub struct JsonRpcTransport {
 impl JsonRpcTransport {
     /// Create a transport pointed at `endpoint` with the given retry limit.
     pub fn new(endpoint: impl Into<String>, max_retries: u32) -> Self {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            reqwest::header::USER_AGENT,
+            reqwest::header::HeaderValue::from_static("Prism/0.1.0"),
+        );
+
         Self {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
+                .default_headers(headers)
                 .build()
                 .expect("failed to build HTTP client"),
             endpoint: endpoint.into(),
@@ -142,6 +153,7 @@ impl JsonRpcTransport {
                 Ok(response) => {
                     let status = response.status();
                     let elapsed_ms = started_at.elapsed().as_millis();
+                    let duration_secs = started_at.elapsed().as_secs_f64();
 
                     tracing::debug!(
                         method,
@@ -154,6 +166,7 @@ impl JsonRpcTransport {
 
                     // Retry on 429 Too Many Requests.
                     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        crate::rpc::record_rpc_duration(method, duration_secs, false);
                         tracing::warn!(method, attempt, "rate limited by RPC endpoint, will retry");
                         last_error = Some(PrismError::RpcError(format!("rate limited (attempt {attempt})")));
                         continue;
@@ -161,6 +174,7 @@ impl JsonRpcTransport {
 
                     // Retry on any 5xx Server Error.
                     if status.is_server_error() {
+                        crate::rpc::record_rpc_duration(method, duration_secs, false);
                         tracing::warn!(
                             method,
                             attempt,
@@ -175,6 +189,7 @@ impl JsonRpcTransport {
                     }
 
                     let body = response.text().await.map_err(|e| {
+                        crate::rpc::record_rpc_duration(method, duration_secs, false);
                         PrismError::RpcError(format!("response read error: {e}"))
                     })?;
 
@@ -182,10 +197,12 @@ impl JsonRpcTransport {
 
                     let envelope: JsonRpcResponse<R> =
                         serde_json::from_str(&body).map_err(|e| {
+                            crate::rpc::record_rpc_duration(method, duration_secs, false);
                             PrismError::RpcError(format!("response parse error: {e}"))
                         })?;
 
                     if let Some(err) = envelope.error {
+                        crate::rpc::record_rpc_duration(method, duration_secs, false);
                         tracing::debug!(
                             method,
                             endpoint = %self.endpoint,
@@ -196,11 +213,14 @@ impl JsonRpcTransport {
                         return Err(PrismError::JsonRpc(err));
                     }
 
+                    crate::rpc::record_rpc_duration(method, duration_secs, true);
                     return envelope
                         .result
                         .ok_or_else(|| PrismError::RpcError("empty result".to_string()));
                 }
                 Err(e) => {
+                    let duration_secs = started_at.elapsed().as_secs_f64();
+                    crate::rpc::record_rpc_duration(method, duration_secs, false);
                     tracing::debug!(
                         method,
                         endpoint = %self.endpoint,
