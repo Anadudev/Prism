@@ -1,6 +1,7 @@
 
 pub mod context;
 pub mod contract_error;
+pub mod cross_contract;
 pub mod diagnostic;
 pub mod host_error;
 pub mod mappings;
@@ -354,6 +355,9 @@ mod tests {
             "resultMetaXdr": meta_b64,
         });
 
+    cross_contract::attribute_failure(&mut report, &tx_data)?;
+
+    Ok(report)
         let result = parse_v3_metadata(&mut data);
         assert!(result.is_ok());
         assert!(data.get("resourceFee").is_none());
