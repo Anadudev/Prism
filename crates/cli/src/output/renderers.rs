@@ -455,12 +455,12 @@ pub fn render_fee_breakdown(fee: &FeeBreakdown) -> String {
 
     if fee.resource_fee > 0 {
         out.push_str(&format!(
-            "    Refundable:       {}\n",
+            "    Refundable Resource Fee:     {}\n",
             palette.muted_text(&format_fee(fee.refundable_fee))
         ));
         out.push_str(&format!(
-            "    Non-Refundable:   {}\n",
-            palette.muted_text(&format_fee(fee.non_refundable_fee))
+            "    Non-Refundable Resource Fee: {}\n",
+            palette.muted_text(&format_fee(fee.non_refundable_resource_fee))
         ));
     }
 
@@ -575,7 +575,7 @@ mod tests {
                 inclusion_fee: 100,
                 resource_fee: 50,
                 refundable_fee: 25,
-                non_refundable_fee: 25,
+                non_refundable_resource_fee: 25,
                 bid_fee: Some(150),
             },
             resources: ResourceSummary {
@@ -601,7 +601,7 @@ mod tests {
             inclusion_fee: 100,
             resource_fee: 50,
             refundable_fee: 25,
-            non_refundable_fee: 25,
+            non_refundable_resource_fee: 25,
             bid_fee: Some(150),
         };
         let output = render_fee_breakdown(&fee);

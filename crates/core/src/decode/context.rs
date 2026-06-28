@@ -143,7 +143,7 @@ fn extract_fee_breakdown(tx_data: &serde_json::Value) -> FeeBreakdown {
         inclusion_fee,
         resource_fee,
         refundable_fee: refundable_fee + rent_fee,
-        non_refundable_fee,
+        non_refundable_resource_fee: non_refundable_fee,
         bid_fee,
     }
 }
@@ -224,7 +224,7 @@ mod tests {
         assert_eq!(breakdown.inclusion_fee, 120);
         assert_eq!(breakdown.resource_fee, 0);
         assert_eq!(breakdown.refundable_fee, 0);
-        assert_eq!(breakdown.non_refundable_fee, 0);
+        assert_eq!(breakdown.non_refundable_resource_fee, 0);
     }
 
     #[test]
@@ -282,6 +282,6 @@ mod tests {
         assert_eq!(breakdown.resource_fee, 350); // 100 + 200 + 50
         assert_eq!(breakdown.inclusion_fee, 100); // 450 - 350
         assert_eq!(breakdown.refundable_fee, 250); // 200 + 50
-        assert_eq!(breakdown.non_refundable_fee, 100);
+        assert_eq!(breakdown.non_refundable_resource_fee, 100);
     }
 }

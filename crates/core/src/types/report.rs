@@ -73,7 +73,7 @@ pub struct FeeBreakdown {
     pub inclusion_fee: i64,
     pub resource_fee: i64,
     pub refundable_fee: i64,
-    pub non_refundable_fee: i64,
+    pub non_refundable_resource_fee: i64,
     pub bid_fee: Option<i64>,
 }
 
