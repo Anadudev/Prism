@@ -13,6 +13,7 @@ pub mod walker;
 
 pub use auth::{
     AddressCredential, AuthChain, AuthCredential, AuthFunctionKind, AuthInvocation,
+    AuthorizationType,
 };
 pub use auth_address_nonce::AddressWithNonce;
 pub use walker::{
@@ -210,10 +211,13 @@ let ctx = decode_context::DecodeContextBuilder::new(network.clone()).build();
         let mut report = report::build_report(&error_info)?;
 
         if error_info.is_contract_error {
+            let ctx = crate::decode::decode_context::DecodeContext::builder()
+                .network(network.clone())
+                .build();
             if let Ok(contract_info) = contract_error::resolve(
                 &error_info.contract_id.unwrap_or_default(),
                 error_info.error_code,
-                network,
+                &ctx,
             )
             .await
             {

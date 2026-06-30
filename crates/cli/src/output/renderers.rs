@@ -2,7 +2,7 @@
 
 use crate::output::theme::ColorPalette;
 use colored::Colorize;
-use prism_core::types::report::{DiagnosticReport, RootCause, TransactionContext, FeeBreakdown};
+use prism_core::types::report::{DiagnosticReport, ResourceSummary, RootCause, TransactionContext, FeeBreakdown};
 use prism_core::types::trace::ResourceProfile;
 use tabled::{Table, Tabled};
 
@@ -423,6 +423,38 @@ impl<'a> StateDiffTable<'a> {
     }
 }
 
+pub fn render_resource_summary(resources: &ResourceSummary) -> String {
+    let palette = ColorPalette::default();
+    let mut out = String::new();
+
+    out.push_str(&render_section_header("Resource Summary"));
+    out.push('\n');
+
+    let cpu_bar = BudgetBar::new("CPU", resources.cpu_instructions_used, resources.cpu_instructions_limit);
+    out.push_str(&format!("  {}\n", cpu_bar.render()));
+
+    let mem_bar = BudgetBar::new("Memory", resources.memory_bytes_used, resources.memory_bytes_limit);
+    out.push_str(&format!("  {}\n", mem_bar.render()));
+
+    let read_bar = BudgetBar::new("Read", resources.read_bytes, resources.read_limit);
+    out.push_str(&format!("  {}\n", read_bar.render()));
+
+    let write_bar = BudgetBar::new("Write", resources.write_bytes, resources.write_limit);
+    out.push_str(&format!("  {}\n", write_bar.render()));
+
+    if resources.write_limit > 0 {
+        let write_pct = (resources.write_bytes as f64 / resources.write_limit as f64) * 100.0;
+        if write_pct > 90.0 {
+            out.push_str(&format!(
+                "  {} Write bytes at {write_pct:.0}% of limit — consider reducing storage writes\n",
+                palette.warning_text("⚠"),
+            ));
+        }
+    }
+
+    out
+}
+
 pub fn render_fee_breakdown(fee: &FeeBreakdown) -> String {
     let palette = ColorPalette::default();
     let mut out = String::new();
@@ -455,12 +487,12 @@ pub fn render_fee_breakdown(fee: &FeeBreakdown) -> String {
 
     if fee.resource_fee > 0 {
         out.push_str(&format!(
-            "    Refundable:       {}\n",
+            "    Refundable Resource Fee:     {}\n",
             palette.muted_text(&format_fee(fee.refundable_fee))
         ));
         out.push_str(&format!(
-            "    Non-Refundable:   {}\n",
-            palette.muted_text(&format_fee(fee.non_refundable_fee))
+            "    Non-Refundable Resource Fee: {}\n",
+            palette.muted_text(&format_fee(fee.non_refundable_resource_fee))
         ));
     }
 
@@ -483,6 +515,8 @@ mod tests {
             memory_limit: 1_000_000,
             total_read_bytes: 0,
             total_write_bytes: 0,
+            read_limit: 0,
+            write_limit: 0,
             hotspots,
             warnings: vec![],
         }
@@ -507,6 +541,11 @@ mod tests {
             }),
             transaction_context: None,
             related_errors: Vec::new(),
+            cross_contract_attribution: None,
+            auth_signatures: Vec::new(),
+            auth_entries: Vec::new(),
+            failing_contract_id: None,
+            learn_more: "https://developers.stellar.org/docs/learn/smart-contracts/errors".to_string(),
         }
     }
 
@@ -575,7 +614,7 @@ mod tests {
                 inclusion_fee: 100,
                 resource_fee: 50,
                 refundable_fee: 25,
-                non_refundable_fee: 25,
+                non_refundable_resource_fee: 25,
                 bid_fee: Some(150),
             },
             resources: ResourceSummary {
@@ -584,7 +623,9 @@ mod tests {
                 memory_bytes_used: 5000,
                 memory_bytes_limit: 50000,
                 read_bytes: 1000,
+                read_limit: 50000,
                 write_bytes: 500,
+                write_limit: 50000,
             },
         };
 
@@ -601,7 +642,7 @@ mod tests {
             inclusion_fee: 100,
             resource_fee: 50,
             refundable_fee: 25,
-            non_refundable_fee: 25,
+            non_refundable_resource_fee: 25,
             bid_fee: Some(150),
         };
         let output = render_fee_breakdown(&fee);

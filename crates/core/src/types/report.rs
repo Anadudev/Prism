@@ -2,6 +2,19 @@
 
 use serde::{Deserialize, Serialize};
 
+/// A summary of a decoded authorization entry, including its detected type.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthEntryInfo {
+    /// Human-readable label: "Ed25519" or "Smart Wallet".
+    pub auth_type: String,
+    /// The authorizing address as a strkey (`G...` for Ed25519, `C...` for Smart Wallet).
+    pub address: String,
+    /// For Smart Wallet entries: the contract ID in strkey form (`C...`).
+    /// `None` for Ed25519 entries.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub contract_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
@@ -73,7 +86,7 @@ pub struct FeeBreakdown {
     pub inclusion_fee: i64,
     pub resource_fee: i64,
     pub refundable_fee: i64,
-    pub non_refundable_fee: i64,
+    pub non_refundable_resource_fee: i64,
     pub bid_fee: Option<i64>,
 }
 
@@ -84,7 +97,9 @@ pub struct ResourceSummary {
     pub memory_bytes_used: u64,
     pub memory_bytes_limit: u64,
     pub read_bytes: u64,
+    pub read_limit: u64,
     pub write_bytes: u64,
+    pub write_limit: u64,
 }
 
 /// Pinpoints the exact contract and function where a cross-contract call chain failed.
@@ -134,6 +149,16 @@ pub struct DiagnosticReport {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub auth_signatures: Vec<String>,
 
+    /// Typed summaries of each authorization entry found in the transaction,
+    /// labelled as Ed25519 or Smart Wallet with the relevant address/contract_id.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub auth_entries: Vec<AuthEntryInfo>,
+
+    /// The contract address most likely responsible for the failure, extracted
+    /// from diagnostic event traces.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub failing_contract_id: Option<String>,
+
     pub learn_more: String,
 }
 
@@ -154,6 +179,8 @@ impl DiagnosticReport {
             related_errors: Vec::new(),
             cross_contract_attribution: None,
             auth_signatures: Vec::new(),
+            auth_entries: Vec::new(),
+            failing_contract_id: None,
             learn_more: "https://developers.stellar.org/docs/learn/smart-contracts/errors".to_string(),  
        }
     }

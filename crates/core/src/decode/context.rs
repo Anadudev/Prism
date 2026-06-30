@@ -1,8 +1,14 @@
 
 
+use crate::decode::auth::{AuthChain, AuthCredential, AuthorizationType};
 use crate::decode::auth_signature::decode_auth_entry_signatures;
 use crate::error::PrismResult;
-use crate::types::report::{DiagnosticReport, FeeBreakdown, ResourceSummary, TransactionContext};
+use crate::types::report::{AuthEntryInfo, DiagnosticReport, FeeBreakdown, ResourceSummary, TransactionContext};
+use crate::xdr::codec::XdrCodec;
+use stellar_xdr::curr::{
+    FeeBumpTransactionInnerTx, LedgerEntryChange, Transaction, TransactionEnvelope, TransactionExt,
+    TransactionMeta, TransactionResult,
+};
 
 pub fn enrich_report(
     report: &mut DiagnosticReport,
@@ -31,6 +37,9 @@ pub fn enrich_report(
     // Decode ed25519 signatures from auth entries embedded in the transaction envelope.
     report.auth_signatures = extract_auth_signatures(tx_data);
 
+    // Build typed auth entry summaries (Ed25519 vs Smart Wallet).
+    report.auth_entries = extract_auth_entries(tx_data);
+
     Ok(())
 }
 
@@ -57,9 +66,6 @@ fn extract_return_value(tx_data: &serde_json::Value) -> Option<String> {
 }
 
 fn extract_fee_breakdown(tx_data: &serde_json::Value) -> FeeBreakdown {
-    use crate::xdr::codec::XdrCodec;
-    use stellar_xdr::curr::{TransactionEnvelope, TransactionResult, TransactionMeta};
-
     // 1. Get total fee from resultXdr
     let mut total_fee = 0;
     if let Some(result_xdr_b64) = tx_data.get("resultXdr").and_then(|v| v.as_str()) {
@@ -143,44 +149,105 @@ fn extract_fee_breakdown(tx_data: &serde_json::Value) -> FeeBreakdown {
         inclusion_fee,
         resource_fee,
         refundable_fee: refundable_fee + rent_fee,
-        non_refundable_fee,
+        non_refundable_resource_fee: non_refundable_fee,
         bid_fee,
     }
 }
 
 fn extract_resource_summary(tx_data: &serde_json::Value) -> ResourceSummary {
-    let mut cpu_used = 0;
-    let mut cpu_limit = 0;
-    let mut mem_used = 0;
-    let mut mem_limit = 0;
+    let mut summary = ResourceSummary {
+        cpu_instructions_used: 0,
+        cpu_instructions_limit: 0,
+        memory_bytes_used: 0,
+        memory_bytes_limit: 0,
+        read_bytes: 0,
+        read_limit: 0,
+        write_bytes: 0,
+        write_limit: 0,
+    };
 
-    if let Some(events) = tx_data.get("diagnosticEvents").and_then(|e| e.as_array()) {
-        for event in events {
-            if event.get("type").and_then(|t| t.as_str()) == Some("budget") {
-                if let Some(data) = event.get("data") {
-                    let category = data.get("category").and_then(|c| c.as_str()).unwrap_or("");
-                    let used = data.get("used").and_then(|u| u.as_u64()).unwrap_or(0);
-                    let limit = data.get("limit").and_then(|l| l.as_u64()).unwrap_or(0);
+    if let Some(meta_xdr_b64) = tx_data.get("resultMetaXdr").and_then(|v| v.as_str()) {
+        if let Ok(tx_meta) = TransactionMeta::from_xdr_base64(meta_xdr_b64) {
+            if let TransactionMeta::V3(v3) = tx_meta {
+                // Compute total write bytes from ledger entry changes:
+                // we sum the XDR-serialized size of every Created and Updated entry.
+                let mut write_bytes: u64 = 0;
+                let mut read_bytes: u64 = 0;
 
-                    if category == "cpu" {
-                        cpu_used = used;
-                        cpu_limit = limit;
-                    } else if category == "memory" {
-                        mem_used = used;
-                        mem_limit = limit;
+                // Helper: compute size of a LedgerEntry's data payload.
+                let entry_size = |entry: &stellar_xdr::curr::LedgerEntry| -> u64 {
+                    XdrCodec::to_xdr_bytes(entry).unwrap_or_default().len() as u64
+                };
+
+                // tx_changes_before — entries that existed before (state snapshot)
+                for change in v3.tx_changes_before.iter() {
+                    if let Ok(entry) = ledger_entry_from_change(change) {
+                        read_bytes += entry_size(&entry);
                     }
                 }
+
+                // per-operation changes
+                for op in v3.operations.iter() {
+                    for change in op.changes.iter() {
+                        match change {
+                            LedgerEntryChange::LedgerEntryCreated(entry) => {
+                                write_bytes += entry_size(entry);
+                            }
+                            LedgerEntryChange::LedgerEntryUpdated(entry) => {
+                                write_bytes += entry_size(entry);
+                            }
+                            LedgerEntryChange::LedgerEntryRemoved(key) => {
+                                if let Ok(key_bytes) = XdrCodec::to_xdr_bytes(key) {
+                                    read_bytes += key_bytes.len() as u64;
+                                }
+                            }
+                            LedgerEntryChange::LedgerEntryState(entry) => {
+                                read_bytes += entry_size(entry);
+                            }
+                        }
+                    }
+                }
+
+                // tx_changes_after — final state (duplicates some operation data, skip to avoid double-count)
+
+                summary.read_bytes = read_bytes;
+                summary.write_bytes = write_bytes;
             }
         }
     }
 
-    ResourceSummary {
-        cpu_instructions_used: cpu_used,
-        cpu_instructions_limit: cpu_limit,
-        memory_bytes_used: mem_used,
-        memory_bytes_limit: mem_limit,
-        read_bytes: 0,
-        write_bytes: 0,
+    // Extract read/write limits from the transaction envelope's SorobanTransactionData
+    if let Some(envelope_xdr_b64) = tx_data.get("envelopeXdr").and_then(|v| v.as_str()) {
+        if let Ok(tx_envelope) = TransactionEnvelope::from_xdr_base64(envelope_xdr_b64) {
+            let inner_tx = inner_transaction(&tx_envelope);
+            if let TransactionExt::V1(soroban_data) = &inner_tx.ext {
+                summary.read_limit = soroban_data.resources.read_bytes as u64;
+                summary.write_limit = soroban_data.resources.write_bytes as u64;
+            }
+        }
+    }
+
+    summary
+}
+
+/// Extract the inner Transaction from any envelope variant.
+fn inner_transaction(envelope: &TransactionEnvelope) -> &Transaction {
+    match envelope {
+        TransactionEnvelope::TxV0(v0) => &v0.tx,
+        TransactionEnvelope::Tx(v1) => &v1.tx,
+        TransactionEnvelope::TxFeeBump(fb) => match &fb.tx.inner_tx {
+            FeeBumpTransactionInnerTx::Tx(v1) => &v1.tx,
+        },
+    }
+}
+
+/// Extract a LedgerEntry from any LedgerEntryChange if the variant carries one.
+fn ledger_entry_from_change(change: &LedgerEntryChange) -> Result<stellar_xdr::curr::LedgerEntry, ()> {
+    match change {
+        LedgerEntryChange::LedgerEntryCreated(entry)
+        | LedgerEntryChange::LedgerEntryUpdated(entry)
+        | LedgerEntryChange::LedgerEntryState(entry) => Ok(entry.clone()),
+        _ => Err(()),
     }
 }
 
@@ -201,6 +268,42 @@ fn extract_auth_signatures(tx_data: &serde_json::Value) -> Vec<String> {
     }
 
     signatures
+}
+
+/// Build typed summaries for each auth entry found in the transaction.
+///
+/// For each entry, an [`AuthEntryInfo`] is produced that labels it as either
+/// Ed25519 or Smart Wallet and surfaces the relevant address / contract ID.
+/// Entries that cannot be decoded are silently skipped to remain non-breaking.
+fn extract_auth_entries(tx_data: &serde_json::Value) -> Vec<AuthEntryInfo> {
+    let mut entries = Vec::new();
+
+    if let Some(auth_array) = tx_data.get("auth").and_then(|a| a.as_array()) {
+        for entry in auth_array {
+            if let Some(xdr_b64) = entry.as_str() {
+                if let Ok(chain) = AuthChain::from_xdr_base64(xdr_b64) {
+                    if let Some(info) = auth_entry_info_from_chain(&chain) {
+                        entries.push(info);
+                    }
+                }
+            }
+        }
+    }
+
+    entries
+}
+
+/// Convert an [`AuthChain`] credential into an [`AuthEntryInfo`] label.
+/// Returns `None` for `SourceAccount` credentials, which carry no address info.
+fn auth_entry_info_from_chain(chain: &AuthChain) -> Option<AuthEntryInfo> {
+    match &chain.credential {
+        AuthCredential::SourceAccount => None,
+        AuthCredential::Address(cred) => Some(AuthEntryInfo {
+            auth_type: cred.auth_type.to_string(),
+            address: cred.address.clone(),
+            contract_id: cred.contract_id.clone(),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -249,7 +352,7 @@ mod tests {
         assert_eq!(breakdown.inclusion_fee, 120);
         assert_eq!(breakdown.resource_fee, 0);
         assert_eq!(breakdown.refundable_fee, 0);
-        assert_eq!(breakdown.non_refundable_fee, 0);
+        assert_eq!(breakdown.non_refundable_resource_fee, 0);
     }
 
     #[test]
@@ -307,6 +410,122 @@ mod tests {
         assert_eq!(breakdown.resource_fee, 350); // 100 + 200 + 50
         assert_eq!(breakdown.inclusion_fee, 100); // 450 - 350
         assert_eq!(breakdown.refundable_fee, 250); // 200 + 50
-        assert_eq!(breakdown.non_refundable_fee, 100);
+        assert_eq!(breakdown.non_refundable_resource_fee, 100);
+    }
+
+    // ── auth_entries extraction tests ──────────────────────────────────────────
+
+    /// Helper: build an auth entry XDR base64 for an account (Ed25519) credential.
+    fn ed25519_auth_entry_b64(nonce: i64) -> String {
+        use stellar_xdr::curr::{
+            AccountId, Hash, InvokeContractArgs, PublicKey, ScAddress, ScSymbol, ScVal,
+            SorobanAddressCredentials, SorobanAuthorizationEntry, SorobanAuthorizedFunction,
+            SorobanAuthorizedInvocation, SorobanCredentials, Uint256,
+        };
+        let entry = SorobanAuthorizationEntry {
+            credentials: SorobanCredentials::Address(SorobanAddressCredentials {
+                address: ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+                    [3u8; 32],
+                )))),
+                nonce,
+                signature_expiration_ledger: 100,
+                signature: ScVal::Void,
+            }),
+            root_invocation: SorobanAuthorizedInvocation {
+                function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                    contract_address: ScAddress::Contract(Hash([9u8; 32])),
+                    function_name: ScSymbol("transfer".try_into().unwrap()),
+                    args: vec![].try_into().unwrap(),
+                }),
+                sub_invocations: vec![].try_into().unwrap(),
+            },
+        };
+        XdrCodec::to_xdr_base64(&entry).expect("encode")
+    }
+
+    /// Helper: build an auth entry XDR base64 for a contract (Smart Wallet) credential.
+    fn smart_wallet_auth_entry_b64(nonce: i64) -> String {
+        use stellar_xdr::curr::{
+            Hash, InvokeContractArgs, ScAddress, ScSymbol, ScVal, SorobanAddressCredentials,
+            SorobanAuthorizationEntry, SorobanAuthorizedFunction, SorobanAuthorizedInvocation,
+            SorobanCredentials,
+        };
+        let entry = SorobanAuthorizationEntry {
+            credentials: SorobanCredentials::Address(SorobanAddressCredentials {
+                address: ScAddress::Contract(Hash([5u8; 32])),
+                nonce,
+                signature_expiration_ledger: 200,
+                signature: ScVal::Void,
+            }),
+            root_invocation: SorobanAuthorizedInvocation {
+                function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                    contract_address: ScAddress::Contract(Hash([8u8; 32])),
+                    function_name: ScSymbol("invoke".try_into().unwrap()),
+                    args: vec![].try_into().unwrap(),
+                }),
+                sub_invocations: vec![].try_into().unwrap(),
+            },
+        };
+        XdrCodec::to_xdr_base64(&entry).expect("encode")
+    }
+
+    #[test]
+    fn extract_auth_entries_detects_ed25519() {
+        let b64 = ed25519_auth_entry_b64(42);
+        let tx_data = serde_json::json!({ "auth": [b64] });
+        let entries = extract_auth_entries(&tx_data);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].auth_type, "Ed25519");
+        assert!(entries[0].address.starts_with('G'));
+        assert!(entries[0].contract_id.is_none());
+    }
+
+    #[test]
+    fn extract_auth_entries_detects_smart_wallet() {
+        let b64 = smart_wallet_auth_entry_b64(99);
+        let tx_data = serde_json::json!({ "auth": [b64] });
+        let entries = extract_auth_entries(&tx_data);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].auth_type, "Smart Wallet");
+        assert!(entries[0].address.starts_with('C'));
+        let contract_id = entries[0].contract_id.as_deref().expect("smart wallet must have contract_id");
+        assert_eq!(contract_id, entries[0].address);
+    }
+
+    #[test]
+    fn extract_auth_entries_handles_multiple_entries() {
+        let b64_ed = ed25519_auth_entry_b64(1);
+        let b64_sw = smart_wallet_auth_entry_b64(2);
+        let tx_data = serde_json::json!({ "auth": [b64_ed, b64_sw] });
+        let entries = extract_auth_entries(&tx_data);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].auth_type, "Ed25519");
+        assert_eq!(entries[1].auth_type, "Smart Wallet");
+    }
+
+    #[test]
+    fn extract_auth_entries_skips_invalid_payloads() {
+        let tx_data = serde_json::json!({ "auth": ["!!!not-valid-xdr!!!"] });
+        let entries = extract_auth_entries(&tx_data);
+        // Invalid entries are silently skipped; no panic.
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn extract_auth_entries_empty_when_no_auth_field() {
+        let tx_data = serde_json::json!({ "hash": "abc123" });
+        let entries = extract_auth_entries(&tx_data);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn existing_ed25519_decoding_unchanged() {
+        // Existing auth_signatures behavior must be preserved for Ed25519 entries.
+        let b64 = ed25519_auth_entry_b64(7);
+        let tx_data = serde_json::json!({ "auth": [b64] });
+        // extract_auth_signatures should still return an empty vec
+        // because the entry has ScVal::Void (no signature bytes).
+        let sigs = extract_auth_signatures(&tx_data);
+        assert!(sigs.is_empty(), "no signature bytes in void-signed entry");
     }
 }
